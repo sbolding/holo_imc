@@ -1,0 +1,188 @@
+#include <stdlib.h>
+#include "../include/HoLoSolver.h"
+
+
+
+HoLoSolver::HoLoSolver():
+_out_file("Z:/TAMU_Research/HOLO/results_output_folder/results.txt", std::ofstream::out)
+{
+	//Check that outfile opend
+	if (! _out_file)
+	{
+		std::cerr << "Can't open output file" << endl;
+		exit(1);
+	}
+
+	//Temporarily hard coded dimensions until there is stuff for reading from input file
+	_dimension = 1;
+	_num_elems = 20;
+	_n_ang_elements = 5; //number angles in half ranges
+	//these variables are only local, no need to store them
+	double sigma_a = 0.019584 ;
+	double sigma_s = 0.225216;
+	double sigma_f = 0.081600;
+	double sigma_t = sigma_a + sigma_f + sigma_s;
+	double width = 1.210110/sigma_t; //cm
+	double nu = 3.24;
+	double ext_source = 1.0; //(p/(sec cm^3)), do not use non-zero values << 1, or some logic may be wrong currently
+	double bc_left = 0.0;
+	double bc_right = 0.0;
+	_mat = new MaterialConstant(10, sigma_a, sigma_s,sigma_f,nu);
+
+	//Temporarily hard coded monte carlo parameters
+	_n_histories = _num_elems * 2 * _n_ang_elements * 100; //50000000
+	_n_batches = 100;
+	_exp_convg_rate = 0.05;
+	_lo_tol = 10.e-3;
+	_solver_mode = "holo-ecmc"; //"standard-mc", "holo-ecmc", "holo-standard-mc"
+	_sampling_method = "stratified";
+
+	//MMS factors
+	double a = 4.0;
+	double b = 2.0;
+	double c = 3.0;
+
+	//for isotropic case
+	//	bc_left = a / 2.;
+	//	bc_right = a / 2. + b*width / 2.;
+
+	//Array for simple isotropic boundary conditions
+	double* bc_values = new double[2];
+	bc_values[0] = bc_left;
+	bc_values[1] = bc_right;
+
+	//Vector of incident flux LD moments for more complicated anisotropic boundary conditions
+	std::vector<std::vector<double>> bc_moments;
+	bc_moments = { { a + 0.5*c, c / 2. }, { a + b*width - 0.5*c, c / 2. } };
+
+	//Create a MMS external source
+	_ext_source = new MMSFixedSource(sigma_a*a, b*sigma_a, (b + c*(sigma_a + sigma_s))); //bilinear function, average, x coeff, mu coeff, that gives matching bc's
+	//	ConstFixedSource q(ext_source/2.0); //constant source (p/(sec-cm^3-str))
+
+	//Create the mesh and elements;
+	_mesh = new Mesh(_dimension, _num_elems, width, _mat, bc_values);
+	//_mesh->setExternalSource(*_ext_source);
+	//_mesh->setBoundaryConditions(bc_moments);
+	_mesh->print(cout);
+
+	_n_holo_solves = 100;
+
+	//For eigenvalue solver initialize external source to zero (this will be changed by solver)
+	_mesh->setExternalSource(0.0);
+	_prob_type = GlobalMethods::EIGEN_VALUE; //eigenvalue problem
+
+	//Assemble the LoSystem
+	//switch (_prob_type) (use case switch here to build correct lo order solver type, currently fixed as eigenvalue
+		//
+	_lo_solver = new LoSolver1DEigen(_mesh, "fixed-point", _lo_tol); //uses default some estimated lo order parameters and LD
+	_ho_solver = new HoSolver(_mesh, _n_histories, _n_ang_elements, _solver_mode, _sampling_method, _exp_convg_rate, _n_batches, 3); //just for debugging purposes
+}
+
+
+HoLoSolver::~HoLoSolver()
+{
+	delete _lo_solver;
+	delete _ho_solver;
+	delete _mat;
+	delete _mesh;
+	delete _ext_source;
+}
+
+void HoLoSolver::solveProblem()
+{
+	using std::cout;
+	using std::endl;
+
+	cout << "We're rolling..." << endl;
+
+	size_t i_holo_solves = 0; //counter
+
+	//Variables for checking convergence
+	std::vector<double> old_flux_vector(_num_elems*(_dimension + 1), 0.0);
+	std::vector<double> new_flux_vector(_num_elems*(_dimension + 1));
+	double old_delta_phi_norm = 0.01;
+	double spectral_radius; //estimate of spectral radius estimated by change in scalar flux values
+
+	while (true)
+	{
+		//solve lo order system
+		_lo_solver->solveSystem();
+		_mesh->getDiscScalarFluxVector(new_flux_vector);
+
+		if (i_holo_solves == 0)
+		{
+			_mesh->printLDScalarFluxValues(_out_file); //TEMPORARY DEBUG print out Mark Diffusion Solution
+			_mesh->printLDScalarFluxValues(cout);
+		}
+		//exit(1); //DEBUG
+
+		//Check convergence of solution 
+		double diff_sum_sq = 0.;
+		double old_sum_sq = 0.;
+		for (int i_vec = 0; i_vec < new_flux_vector.size(); i_vec++)
+		{
+			double diff = new_flux_vector[i_vec] - old_flux_vector[i_vec];
+			diff_sum_sq += diff*diff;
+			old_sum_sq += old_flux_vector[i_vec] * old_flux_vector[i_vec];
+		}
+		double diff_norm = std::sqrt(diff_sum_sq);
+		double relative_diff_norm = diff_norm / std::sqrt(old_sum_sq);
+		spectral_radius = std::sqrt(diff_sum_sq) / old_delta_phi_norm;
+		double error = std::abs(relative_diff_norm / (1. - spectral_radius));
+		std::cout << "Error estimate based on spectral radius: " << error << std::endl;
+		std::cout << "Spectral Radius = " << spectral_radius << " Relative Difference = " <<
+			relative_diff_norm << " Abs Diff Phi = " << diff_norm << std::endl;
+		if (error < _lo_tol)
+		{
+			std::cout << "\nConverged on iteration " << i_holo_solves << " to a relative precision"
+				<< " of " << _lo_tol << std::endl;
+			//		_lo_solver->solveSystem();
+			//		_lo_solver->updateSystem();
+			_mesh->printLDScalarFluxValues(_out_file);
+			_mesh->printLDScalarFluxValues(std::cout);
+			_ho_solver->printProjectedScalarFlux(_out_file);
+			break;
+		}
+		else
+		{
+			old_delta_phi_norm = diff_norm;
+			old_flux_vector = new_flux_vector;
+		}
+
+		if (i_holo_solves == _n_holo_solves) //do one extra LO solve, because it is the only solution really being calculated
+		{
+			_mesh->printLDScalarFluxValues(_out_file);
+			_mesh->printLDScalarFluxValues(std::cout);
+			break;
+		}
+
+		//Solve high order system
+		delete _ho_solver; //release old ho_solver memory
+		_ho_solver = new HoSolver(_mesh, _n_histories, _n_ang_elements, _solver_mode, _sampling_method, _exp_convg_rate, _n_batches, 3);
+		_ho_solver->solveSystem();
+		_ho_solver->updateSystem();
+		_ho_solver->printProjectedScalarFlux(std::cout);
+
+		//Transfer HO estimated parameters to the LO system
+		DataTransfer data_transfer(_ho_solver, _mesh);
+		data_transfer.updateLoSystem();
+		if (HoController::WRITE_ALL_LO_DATA)
+		{
+			data_transfer.printAllLoData(std::cout);
+		}
+
+		//update counter
+		i_holo_solves++;
+
+	}
+
+
+
+
+}
+
+void HoLoSolver::parseInputFile()
+{
+	std::cerr << "Not done yet\n";
+	exit(1);
+}
